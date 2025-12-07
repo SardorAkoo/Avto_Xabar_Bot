@@ -12,14 +12,7 @@ from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKe
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, PhoneNumberInvalidError, PhoneCodeInvalidError
-
-# PIL import (rasm siqish uchun)
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-    print("⚠️ PIL/Pillow o'rnatilmagan. Rasmlar siqilmaydi. O'rnatish: pip install Pillow")
+from telethon.tl.types import InputPeerChannel
 
 # ========== KONFIGURATSIYA ==========
 ADMIN_ID = 2091226701  # O'zingizning Telegram ID'ingiz
@@ -28,6 +21,9 @@ BOT_TOKEN = "8289173554:AAERukM8xkPMbBZPi2ot8nvPzxC2s5T5xDQ"  # @BotFather dan o
 # Telegram API ma'lumotlari (my.telegram.org dan oling)
 API_ID = 16307694
 API_HASH = "de4b653676e085ce3d0f3d64f8741ae4"
+
+# Ommaviy Arxiv Kanal (Media fayllar uchun)
+STORAGE_CHANNEL_USERNAME = "@ajskhdgjasduouwqyuvdqhuq"  # O'z kanalingizni username bilan almashtiring
 
 # Logging yoqish
 logging.basicConfig(
@@ -42,15 +38,21 @@ DB_FILE = "telegram_bot.db"
 # Session fayllar papkasi
 SESSIONS_DIR = "sessions"
 
-# Media fayllar papkasi
-MEDIA_DIR = "media"
-
 # Global o'zgaruvchilar
 is_sending = False
 last_send_time = None
 min_interval = 20  # Minimal interval (daqiqa)
 max_interval = 25  # Maksimal interval (daqiqa)
 random_messages = True  # Random xabarlarni yuborish
+
+# ========== HELPER FUNCTIONS ==========
+
+def get_storage_channel():
+    """Arxiv kanal ID'sini olish"""
+    storage_channel = get_setting('storage_channel', STORAGE_CHANNEL_USERNAME)
+    if storage_channel and storage_channel != 'not_set':
+        return storage_channel
+    return STORAGE_CHANNEL_USERNAME
 
 # ========== TELEGRAM CLIENT FUNCTIONS ==========
 
@@ -60,134 +62,11 @@ def init_sessions_dir():
         os.makedirs(SESSIONS_DIR)
         logger.info(f"📁 Sessions papkasi yaratildi: {SESSIONS_DIR}")
 
-def init_media_dir():
-    """Media papkasini yaratish"""
-    if not os.path.exists(MEDIA_DIR):
-        os.makedirs(MEDIA_DIR)
-        logger.info(f"📁 Media papkasi yaratildi: {MEDIA_DIR}")
-
-def get_user_media_dir(user_id):
-    """Foydalanuvchi media papkasini olish va yaratish"""
-    user_dir = os.path.join(MEDIA_DIR, str(user_id))
-    if not os.path.exists(user_dir):
-        os.makedirs(user_dir)
-    return user_dir
-
-def calculate_file_hash(file_bytes):
-    """Fayl hash ni hisoblash (MD5)"""
-    return hashlib.md5(file_bytes).hexdigest()
-
-def compress_image(file_bytes, quality=70):
-    """Rasmni siqish (PIL orqali)"""
-    if not PIL_AVAILABLE:
-        return file_bytes, None
-    
-    try:
-        # Rasm ochish
-        img = Image.open(io.BytesIO(file_bytes))
-        
-        # RGBA bo'lsa RGB ga o'tkazish
-        if img.mode in ('RGBA', 'LA', 'P'):
-            background = Image.new('RGB', img.size, (255, 255, 255))
-            if img.mode == 'P':
-                img = img.convert('RGBA')
-            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-            img = background
-        elif img.mode != 'RGB':
-            img = img.convert('RGB')
-        
-        # Siqish
-        output = io.BytesIO()
-        img.save(output, format='JPEG', quality=quality, optimize=True)
-        compressed_bytes = output.getvalue()
-        
-        # Agar siqilgan fayl kattaroq bo'lsa, aslini qaytarish
-        if len(compressed_bytes) >= len(file_bytes):
-            return file_bytes, None
-        
-        logger.info(f"🗜️ Rasm siqildi: {len(file_bytes)} -> {len(compressed_bytes)} bytes ({100 - len(compressed_bytes)*100//len(file_bytes)}% tejaldi)")
-        return compressed_bytes, 'jpg'
-        
-    except Exception as e:
-        logger.error(f"Rasm siqishda xato: {e}")
-        return file_bytes, None
-
-def get_file_extension(message_type, file_name=None):
-    """Fayl kengaytmasini olish"""
-    if file_name:
-        ext = os.path.splitext(file_name)[1].lower()
-        if ext:
-            return ext[1:]  # . ni olib tashlash
-    
-    # Default kengaytmalar
-    extensions = {
-        'photo': 'jpg',
-        'video': 'mp4',
-        'document': 'bin',
-        'audio': 'mp3',
-        'voice': 'ogg',
-        'sticker': 'webp',
-        'animation': 'mp4',
-        'video_note': 'mp4'
-    }
-    return extensions.get(message_type, 'bin')
-
-async def save_media_file(bot, file_id, user_id, message_type, file_name=None):
-    """Media faylni yuklab olish va saqlash"""
-    try:
-        # Faylni Telegram serveridan yuklab olish
-        file = await bot.get_file(file_id)
-        file_bytes = await file.download_as_bytearray()
-        file_bytes = bytes(file_bytes)
-        
-        # Kengaytma aniqlash
-        ext = get_file_extension(message_type, file_name)
-        
-        # Rasmlar uchun siqish
-        if message_type == 'photo' and PIL_AVAILABLE:
-            file_bytes, new_ext = compress_image(file_bytes)
-            if new_ext:
-                ext = new_ext
-        
-        # Hash hisoblash
-        file_hash = calculate_file_hash(file_bytes)
-        
-        # Foydalanuvchi papkasini olish
-        user_dir = get_user_media_dir(user_id)
-        
-        # Fayl yo'li
-        file_path = os.path.join(user_dir, f"{file_hash}.{ext}")
-        
-        # Agar fayl allaqachon mavjud bo'lsa, qaytadan yuklamaslik
-        if os.path.exists(file_path):
-            logger.info(f"📁 Fayl allaqachon mavjud (dublikat): {file_path}")
-            return file_path, file_hash
-        
-        # Faylni saqlash
-        with open(file_path, 'wb') as f:
-            f.write(file_bytes)
-        
-        logger.info(f"📁 Media fayl saqlandi: {file_path} ({len(file_bytes)} bytes)")
-        return file_path, file_hash
-        
-    except Exception as e:
-        logger.error(f"Media fayl saqlashda xato: {e}")
-        return None, None
-
-def delete_media_file(file_path):
-    """Media faylni o'chirish"""
-    try:
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-            logger.info(f"🗑️ Media fayl o'chirildi: {file_path}")
-            return True
-    except Exception as e:
-        logger.error(f"Media fayl o'chirishda xato: {e}")
-    return False
-
 def get_session_path(display_name):
     """Session fayl yo'lini olish"""
-    return os.path.join(SESSIONS_DIR, f"{display_name}.session")
+    # Display name'dagi maxsus belgilarni tozalash
+    safe_name = ''.join(c for c in display_name if c.isalnum() or c in ('_', '-'))
+    return os.path.join(SESSIONS_DIR, f"{safe_name}.session")
 
 def session_exists(display_name):
     """Session fayli mavjudligini tekshirish"""
@@ -227,7 +106,7 @@ async def create_and_auth_session(user_id, display_name, phone):
                 conn = sqlite3.connect(DB_FILE)
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT INTO pending_sessions (display_name, phone, code_hash, user_id, created_at)
+                    INSERT OR REPLACE INTO pending_sessions (display_name, phone, code_hash, user_id, created_at)
                     VALUES (?, ?, ?, ?, ?)
                 ''', (display_name, phone, sent_code.phone_code_hash, user_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
                 conn.commit()
@@ -347,7 +226,7 @@ async def enter_code(display_name, code):
             
         except SessionPasswordNeededError:
             await client.disconnect()
-            return False, "❗️ **2FA paroli kerak!**\n\nParolni kiriting: `/password {display_name} PAROL`"
+            return False, f"❗️ **2FA paroli kerak!**\n\nParolni kiriting: `/password {display_name} PAROL`"
             
         except PhoneCodeInvalidError:
             await client.disconnect()
@@ -457,13 +336,95 @@ async def test_session(display_name):
         logger.error(f"Session testda xato: {e}")
         return False, f"❌ Xato: {str(e)}"
 
+async def save_media_to_channel(bot, message, user_id, message_type, file_name=None):
+    """Media faylni arxiv kanaliga saqlash (lokal diskga yuklamasdan)"""
+    try:
+        # Arxiv kanalini olish
+        storage_channel = get_storage_channel()
+        
+        if storage_channel == 'not_set':
+            return None, "❌ Arxiv kanali sozlanmagan! Admin: Sozlamalar -> Arxiv kanali"
+        
+        # Arxiv kanaliga xabarni ko'chirish
+        caption = message.caption or ""
+        user_caption = f"User: {user_id}"
+        if caption:
+            final_caption = f"{caption}\n\n{user_caption}"
+        else:
+            final_caption = user_caption
+        
+        # Bot orqali xabarni nusxalash
+        if message_type == 'photo':
+            # Photo uchun eng katta o'lchamdagi rasmni olish
+            photo = message.photo[-1]
+            sent_message = await bot.copy_message(
+                chat_id=storage_channel,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+                caption=final_caption
+            )
+        elif message_type == 'video':
+            sent_message = await bot.copy_message(
+                chat_id=storage_channel,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+                caption=final_caption
+            )
+        elif message_type == 'document':
+            sent_message = await bot.copy_message(
+                chat_id=storage_channel,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+                caption=final_caption
+            )
+        elif message_type == 'audio':
+            sent_message = await bot.copy_message(
+                chat_id=storage_channel,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+                caption=final_caption
+            )
+        elif message_type == 'voice':
+            sent_message = await bot.copy_message(
+                chat_id=storage_channel,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+                caption=final_caption
+            )
+        elif message_type == 'sticker':
+            sent_message = await bot.copy_message(
+                chat_id=storage_channel,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id
+            )
+        elif message_type == 'animation':
+            sent_message = await bot.copy_message(
+                chat_id=storage_channel,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+                caption=final_caption
+            )
+        elif message_type == 'video_note':
+            sent_message = await bot.copy_message(
+                chat_id=storage_channel,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+                caption=final_caption
+            )
+        else:
+            return None, None
+        
+        storage_data = f"{storage_channel}:{sent_message.message_id}"
+        
+        logger.info(f"📦 Media arxivlandi: {storage_data} (type: {message_type})")
+        return storage_data, None
+        
+    except Exception as e:
+        logger.error(f"Media arxivlashda xato: {e}")
+        return None, f"Media arxivlashda xato: {str(e)}"
+
 async def send_message_to_group(display_name, group_identifier, message_data):
-    """Guruhga xabar yuborish (har qanday turdagi xabar)
-    
-    message_data: dict yoki str
-        - Agar str bo'lsa: oddiy text xabar (eski usulga mos)
-        - Agar dict bo'lsa: {'message_type': ..., 'file_path': ..., 'text': ...}
-    """
+    """Guruhga xabar yuborish (arxiv kanalidan media o'qib)"""
     try:
         session_path = get_session_path(display_name)
         
@@ -497,70 +458,107 @@ async def send_message_to_group(display_name, group_identifier, message_data):
                 entity = await client.get_entity(int(group_identifier))
             else:
                 # Username sifatida urinib ko'rish
-                entity = await client.get_entity(f"@{group_identifier}")
+                try:
+                    entity = await client.get_entity(f"@{group_identifier}")
+                except:
+                    try:
+                        entity = await client.get_entity(int(group_identifier))
+                    except:
+                        return False, f"Guruh topilmadi: {group_identifier}"
             
             # Xabar yuborish - turga qarab
             if isinstance(message_data, str):
                 # Eski usul - oddiy text
                 await client.send_message(entity, message_data)
+                await client.disconnect()
+                return True, f"✅ Text xabar yuborildi: {group_identifier}"
+                
             elif isinstance(message_data, dict):
                 message_type = message_data.get('message_type', 'text')
-                file_path = message_data.get('file_path')
+                storage_data = message_data.get('storage_data')  # CHAT_ID:MESSAGE_ID formatida
                 text = message_data.get('text', '')
                 
                 if message_type == 'text':
                     # Text xabar
                     await client.send_message(entity, text)
-                elif file_path and os.path.exists(file_path):
-                    # Media xabar - local file path orqali yuborish
-                    if message_type in ['photo', 'video', 'document', 'audio', 'voice', 'animation', 'video_note']:
-                        try:
-                            # Local file orqali yuborish - to'g'ri ishlaydi!
-                            await client.send_file(
-                                entity, 
-                                file_path, 
-                                caption=text if text else None,
-                                force_document=(message_type == 'document')
-                            )
-                        except Exception as file_error:
-                            logger.error(f"Fayl yuborishda xato: {file_error}")
-                            # Agar fayl bilan yuborib bo'lmasa, text yuboramiz
-                            if text:
-                                await client.send_message(entity, text)
-                                return True, f"⚠️ Faqat text yuborildi (media xato): {group_identifier}"
-                            else:
-                                return False, f"Fayl yuborib bo'lmadi: {str(file_error)}"
-                    elif message_type == 'sticker':
-                        try:
-                            await client.send_file(entity, file_path)
-                        except Exception as sticker_error:
-                            logger.warning(f"Sticker yuborib bo'lmadi: {sticker_error}")
-                            return False, f"Sticker yuborib bo'lmadi: {str(sticker_error)}"
-                    else:
-                        # Noma'lum tur - text yuborish
+                    await client.disconnect()
+                    return True, f"✅ Text xabar yuborildi: {group_identifier}"
+                    
+                elif storage_data:
+                    # Arxiv kanalidan media yuklab olish
+                    try:
+                        # CHAT_ID:MESSAGE_ID ni ajratish
+                        if ':' in storage_data:
+                            chat_id_str, message_id_str = storage_data.split(':')
+                            try:
+                                chat_id = int(chat_id_str) if chat_id_str.lstrip('-').isdigit() else chat_id_str
+                                message_id = int(message_id_str)
+                                
+                                # Arxiv kanalidan xabarni olish
+                                storage_channel = await client.get_entity(chat_id)
+                                
+                                msg = await client.get_messages(storage_channel, ids=message_id)
+                                
+                                if msg:
+                                    # Media bilan birga yuborish
+                                    if msg.photo:
+                                        await client.send_file(entity, msg.photo, caption=text if text else None)
+                                    elif msg.video:
+                                        await client.send_file(entity, msg.video, caption=text if text else None)
+                                    elif msg.document:
+                                        await client.send_file(entity, msg.document, caption=text if text else None)
+                                    elif msg.audio:
+                                        await client.send_file(entity, msg.audio, caption=text if text else None)
+                                    elif msg.voice:
+                                        await client.send_file(entity, msg.voice, caption=text if text else None)
+                                    elif msg.sticker:
+                                        await client.send_file(entity, msg.sticker)
+                                    elif msg.gif:
+                                        await client.send_file(entity, msg.gif, caption=text if text else None)
+                                    elif msg.video_note:
+                                        await client.send_file(entity, msg.video_note, caption=text if text else None)
+                                    else:
+                                        # Agar media topilmasa, text yuborish
+                                        if text:
+                                            await client.send_message(entity, text)
+                                        await client.disconnect()
+                                        return True, f"⚠️ Faqat text yuborildi (media topilmadi): {group_identifier}"
+                                    
+                                    await client.disconnect()
+                                    return True, f"✅ Media xabar yuborildi: {group_identifier}"
+                                else:
+                                    await client.disconnect()
+                                    return False, f"Arxiv kanalida xabar topilmadi: {storage_data}"
+                            except ValueError:
+                                logger.error(f"Noto'g'ri storage_data formati: {storage_data}")
+                                if text:
+                                    await client.send_message(entity, text)
+                                    await client.disconnect()
+                                    return True, f"⚠️ Faqat text yuborildi (arxiv xato): {group_identifier}"
+                                await client.disconnect()
+                                return False, f"Noto'g'ri storage_data formati: {storage_data}"
+                    except Exception as file_error:
+                        logger.error(f"Fayl yuborishda xato: {file_error}")
+                        # Agar fayl bilan yuborib bo'lmasa, text yuboramiz
                         if text:
                             await client.send_message(entity, text)
+                            await client.disconnect()
+                            return True, f"⚠️ Faqat text yuborildi (media xato): {group_identifier}"
                         else:
-                            return False, f"Noma'lum xabar turi: {message_type}"
-                elif file_path:
-                    # Fayl yo'li bor lekin fayl mavjud emas
-                    logger.error(f"Fayl topilmadi: {file_path}")
-                    if text:
-                        await client.send_message(entity, text)
-                        return True, f"⚠️ Faqat text yuborildi (fayl topilmadi): {group_identifier}"
-                    return False, f"Fayl topilmadi: {file_path}"
+                            await client.disconnect()
+                            return False, f"Fayl yuborib bo'lmadi: {str(file_error)}"
                 else:
-                    # file_path yo'q
+                    # storage_data yo'q
                     if text:
                         await client.send_message(entity, text)
+                        await client.disconnect()
+                        return True, f"✅ Text xabar yuborildi: {group_identifier}"
                     else:
+                        await client.disconnect()
                         return False, "Xabar ma'lumotlari noto'g'ri"
             else:
+                await client.disconnect()
                 return False, "Noma'lum xabar formati"
-            
-            await client.disconnect()
-            
-            return True, f"✅ Xabar yuborildi: {group_identifier}"
             
         except Exception as e:
             await client.disconnect()
@@ -579,42 +577,7 @@ def init_database():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # Agar baza mavjud bo'lsa, is_default ustunini qo'shish (migratsiya)
-    if db_exists:
-        try:
-            cursor.execute('SELECT is_default FROM accounts LIMIT 1')
-        except sqlite3.OperationalError:
-            # Ustun mavjud emas, qo'shamiz
-            cursor.execute('ALTER TABLE accounts ADD COLUMN is_default INTEGER DEFAULT 0')
-            conn.commit()
-            print("✅ is_default ustuni qo'shildi")
-        
-        # Messages jadvaliga message_type, file_path, file_hash ustunlarini qo'shish (migratsiya)
-        try:
-            cursor.execute('SELECT message_type FROM messages LIMIT 1')
-        except sqlite3.OperationalError:
-            cursor.execute('ALTER TABLE messages ADD COLUMN message_type TEXT DEFAULT "text"')
-            conn.commit()
-            print("✅ message_type ustuni qo'shildi")
-        
-        # Eski file_id ustunini file_path ga o'zgartirish (migratsiya)
-        try:
-            cursor.execute('SELECT file_path FROM messages LIMIT 1')
-        except sqlite3.OperationalError:
-            # file_path ustuni yo'q, qo'shamiz
-            cursor.execute('ALTER TABLE messages ADD COLUMN file_path TEXT')
-            conn.commit()
-            print("✅ file_path ustuni qo'shildi")
-        
-        try:
-            cursor.execute('SELECT file_hash FROM messages LIMIT 1')
-        except sqlite3.OperationalError:
-            cursor.execute('ALTER TABLE messages ADD COLUMN file_hash TEXT')
-            conn.commit()
-            print("✅ file_hash ustuni qo'shildi")
-        
-        print(f"✅ Baza mavjud: {DB_FILE}")
-    
+    # Jadvalarni yaratish
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -648,8 +611,7 @@ def init_database():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         message_type TEXT DEFAULT 'text',
-        file_path TEXT,
-        file_hash TEXT,
+        storage_data TEXT,
         text TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
@@ -718,7 +680,8 @@ def init_database():
         ('welcome_message', 'Botdan foydalanish uchun ruxsat kerak. Ruxsat olish uchun @Okean_manager ga murojaat qiling.'),
         ('admin_contact', '@Okean_manager'),
         ('api_id', str(API_ID)),
-        ('api_hash', API_HASH)
+        ('api_hash', API_HASH),
+        ('storage_channel', STORAGE_CHANNEL_USERNAME)
     ]
     
     for key, value in default_settings:
@@ -770,14 +733,23 @@ def get_user_interval(user_id):
     if result:
         return result[0], result[1]
     else:
-        # Default interval
-        return 20, 25
+        # Global sozlamalardan olish
+        global_min = int(get_setting('min_interval', '20'))
+        global_max = int(get_setting('max_interval', '25'))
+        return global_min, global_max
 
 def get_next_account_number(user_id):
     """Foydalanuvchi uchun keyingi account raqamini olish (max 5 ta)"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute('SELECT display_name FROM accounts WHERE user_id = ? AND display_name LIKE "account%"', (user_id,))
+    
+    # Foydalanuvchining barcha hisoblarini olish
+    cursor.execute('''
+        SELECT display_name FROM accounts 
+        WHERE user_id = ? 
+        AND display_name LIKE ?
+    ''', (user_id, f'account_{user_id}_%'))
+    
     accounts = cursor.fetchall()
     conn.close()
     
@@ -787,8 +759,10 @@ def get_next_account_number(user_id):
     numbers = []
     for acc in accounts:
         try:
-            num = int(acc[0].replace("account", ""))
-            numbers.append(num)
+            # Format: account_USERID_NUMBER (account_123456789_1)
+            parts = acc[0].split('_')
+            if len(parts) >= 3 and parts[-1].isdigit():
+                numbers.append(int(parts[-1]))
         except:
             continue
     
@@ -796,6 +770,12 @@ def get_next_account_number(user_id):
         # Faqat 5 tagacha ruxsat berish
         if len(numbers) >= 5:
             return None  # 5 tadan ko'p bo'lmasligi kerak
+        
+        # 1 dan 5 gacha bo'sh raqamni topish
+        for i in range(1, 6):
+            if i not in numbers:
+                return i
+        
         return max(numbers) + 1
     else:
         return 1
@@ -825,13 +805,30 @@ def add_user_account(user_id, phone="", country_code="", username="", display_na
             if account_number is None:
                 logger.warning(f"Foydalanuvchi {user_id} uchun hisob limitiga yetildi (5 ta)")
                 return None
-            display_name = f"account{account_number}"
+            
+            # Yangi format: account_USERID_NUMBER
+            display_name = f"account_{user_id}_{account_number}"
+            logger.info(f"🎯 Yangi display name yaratildi: {display_name}")
         
         # Telefon raqamni tekshirish
         if phone:
-            cursor.execute('SELECT id FROM accounts WHERE phone = ?', (phone,))
-            if cursor.fetchone():
-                logger.warning(f"Bu telefon raqam allaqachon mavjud: {phone}")
+            cursor.execute('SELECT display_name, user_id FROM accounts WHERE phone = ?', (phone,))
+            existing_phone = cursor.fetchone()
+            if existing_phone:
+                logger.warning(f"Bu telefon raqam allaqachon mavjud: {phone} (Hisob: {existing_phone[0]}, User: {existing_phone[1]})")
+                return None
+        
+        # Display name allaqachon mavjudligini tekshirish
+        cursor.execute('SELECT user_id, phone FROM accounts WHERE display_name = ?', (display_name,))
+        existing_name = cursor.fetchone()
+        if existing_name:
+            logger.warning(f"Bu display name allaqachon mavjud: {display_name} (User: {existing_name[0]}, Phone: {existing_name[1]})")
+            # Yangi raqam topish
+            account_number = get_next_account_number(user_id)
+            if account_number:
+                display_name = f"account_{user_id}_{account_number}"
+                logger.info(f"🔄 Yangi display name: {display_name}")
+            else:
                 return None
         
         cursor.execute('''
@@ -840,12 +837,21 @@ def add_user_account(user_id, phone="", country_code="", username="", display_na
         ''', (user_id, display_name, phone, country_code, username))
         conn.commit()
         
-        logger.info(f"✅ Hisob qo'shildi: {display_name}")
+        logger.info(f"✅ Hisob qo'shildi: {display_name} (User: {user_id}, Phone: +{phone})")
         
         return display_name
         
     except sqlite3.IntegrityError as e:
-        logger.error(f"Bazaga qo'shishda xato: {e}")
+        logger.error(f"Bazaga qo'shishda xato (IntegrityError): {e}")
+        
+        # Qaysi constraint buzilganligini aniqlash
+        if "display_name" in str(e):
+            logger.error(f"Display name conflict: {display_name}")
+            # Barcha mavjud display namelarni ko'rish
+            cursor.execute('SELECT display_name FROM accounts ORDER BY display_name')
+            all_accounts = cursor.fetchall()
+            logger.info(f"Barcha mavjud hisoblar: {all_accounts}")
+            
         return None
     finally:
         conn.close()
@@ -960,6 +966,59 @@ def update_user_subscription(user_id, days):
         return None
     finally:
         conn.close()
+
+async def delete_user_data_from_channel(user_id, context=None):
+    """Foydalanuvchi ma'lumotlarini arxiv kanaldan o'chirish"""
+    try:
+        # Foydalanuvchining barcha media xabarlarini olish
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('SELECT storage_data FROM messages WHERE user_id = ? AND storage_data IS NOT NULL', (user_id,))
+        storage_items = cursor.fetchall()
+        conn.close()
+        
+        deleted_count = 0
+        failed_count = 0
+        
+        for (storage_data,) in storage_items:
+            if storage_data and ':' in storage_data:
+                try:
+                    chat_id_str, message_id_str = storage_data.split(':')
+                    try:
+                        chat_id = int(chat_id_str) if chat_id_str.lstrip('-').isdigit() else chat_id_str
+                        message_id = int(message_id_str)
+                        
+                        # Bot orqali xabarni o'chirish
+                        if context and context.bot:
+                            await context.bot.delete_message(
+                                chat_id=chat_id,
+                                message_id=message_id
+                            )
+                            deleted_count += 1
+                            logger.info(f"🗑️ Arxivdan xabar o'chirildi: {storage_data}")
+                        else:
+                            # Agar context bo'lmasa, bot yaratish
+                            from telegram import Bot
+                            bot = Bot(token=BOT_TOKEN)
+                            await bot.delete_message(
+                                chat_id=chat_id,
+                                message_id=message_id
+                            )
+                            deleted_count += 1
+                            logger.info(f"🗑️ Arxivdan xabar o'chirildi: {storage_data}")
+                    except ValueError:
+                        logger.error(f"Noto'g'ri message_id formati: {message_id_str}")
+                        failed_count += 1
+                except Exception as e:
+                    logger.error(f"Xabarni o'chirishda xato ({storage_data}): {e}")
+                    failed_count += 1
+        
+        logger.info(f"🗑️ Arxivdan {deleted_count} ta xabar o'chirildi, {failed_count} ta xato")
+        return deleted_count, failed_count
+        
+    except Exception as e:
+        logger.error(f"delete_user_data_from_channel xatosi: {e}")
+        return 0, 0
 
 def delete_user_data(user_id):
     """Foydalanuvchi ma'lumotlarini tozalash"""
@@ -1192,14 +1251,14 @@ def update_group_active_status(group_ids, is_active):
     conn.close()
     return updated_count
 
-def add_user_message(user_id, text, message_type='text', file_path=None, file_hash=None):
-    """Foydalanuvchi xabarini qo'shish (har qanday tur)"""
+def add_user_message(user_id, text, message_type='text', storage_data=None):
+    """Foydalanuvchi xabarini qo'shish (arxiv kanal ma'lumoti bilan)"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO messages (user_id, message_type, file_path, file_hash, text) 
-        VALUES (?, ?, ?, ?, ?)
-    ''', (user_id, message_type, file_path, file_hash, text))
+        INSERT INTO messages (user_id, message_type, storage_data, text) 
+        VALUES (?, ?, ?, ?)
+    ''', (user_id, message_type, storage_data, text))
     conn.commit()
     conn.close()
 
@@ -1208,7 +1267,7 @@ def get_user_messages(user_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT id, message_type, file_path, file_hash, text 
+        SELECT id, message_type, storage_data, text 
         FROM messages 
         WHERE user_id = ? 
         ORDER BY id
@@ -1223,63 +1282,35 @@ def get_random_user_message(user_id):
     if not messages:
         return None
     msg = random.choice(messages)
-    # (id, message_type, file_path, file_hash, text)
+    # (id, message_type, storage_data, text)
     return {
         'id': msg[0],
         'message_type': msg[1] or 'text',
-        'file_path': msg[2],
-        'file_hash': msg[3],
-        'text': msg[4]
+        'storage_data': msg[2],  # CHAT_ID:MESSAGE_ID formatida
+        'text': msg[3]
     }
 
 def delete_user_messages(user_id):
-    """Foydalanuvchi barcha xabarlarini o'chirish (media fayllar bilan birga)"""
+    """Foydalanuvchi barcha xabarlarini o'chirish (faqat bazadan)"""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        
-        # Avval barcha media fayl yo'llarini olish
-        cursor.execute('SELECT file_path FROM messages WHERE user_id = ? AND file_path IS NOT NULL', (user_id,))
-        files = cursor.fetchall()
-        
-        # Media fayllarni o'chirish
-        for (file_path,) in files:
-            if file_path:
-                delete_media_file(file_path)
-        
-        # Foydalanuvchi media papkasini ham o'chirish
-        user_dir = os.path.join(MEDIA_DIR, str(user_id))
-        if os.path.exists(user_dir):
-            try:
-                import shutil
-                shutil.rmtree(user_dir)
-                logger.info(f"🗑️ Foydalanuvchi media papkasi o'chirildi: {user_dir}")
-            except Exception as e:
-                logger.error(f"Papkani o'chirishda xato: {e}")
         
         cursor.execute('DELETE FROM messages WHERE user_id = ?', (user_id,))
         deleted_count = cursor.rowcount
         conn.commit()
         conn.close()
-        logger.info(f"✅ {deleted_count} ta xabar o'chirildi (user_id: {user_id})")
+        logger.info(f"✅ {deleted_count} ta xabar bazadan o'chirildi (user_id: {user_id})")
         return deleted_count
     except Exception as e:
         logger.error(f"delete_user_messages xatosi: {e}")
         return 0
 
 def delete_single_message(message_id):
-    """Bitta xabarni o'chirish (media fayl bilan birga)"""
+    """Bitta xabarni o'chirish (faqat bazadan)"""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        
-        # Avval media fayl yo'lini olish
-        cursor.execute('SELECT file_path FROM messages WHERE id = ?', (message_id,))
-        result = cursor.fetchone()
-        
-        if result and result[0]:
-            # Media faylni o'chirish
-            delete_media_file(result[0])
         
         cursor.execute('DELETE FROM messages WHERE id = ?', (message_id,))
         deleted = cursor.rowcount > 0
@@ -1338,7 +1369,8 @@ def get_admin_keyboard():
         ["📊 Statistika", "⚙️ Sozlamalar"],
         ["🔄 Session boshqarish", "🔄 Avtomatik yuborish"],
         ["⏸️ To'xtatish", "🔄 Yangilash"],
-        ["📢 Xabar yuborish"]
+        ["📢 Xabar yuborish"],
+        ["📌 Kanal ID o'rnatish (Ixtiyoriy)"]
     ], resize_keyboard=True)
 
 def get_user_keyboard():
@@ -1375,7 +1407,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "👑 **Admin Paneli**\n\n"
             f"📊 Jami foydalanuvchilar: {len(get_all_users())}\n"
-            f"⏳ Kutilayotgan so'rovlar: {len(pending_requests)}\n\n"
+            f"⏳ Kutilayotgan so'rovlar: {len(pending_requests)}\n"
+            f"📦 Arxiv kanal: {get_setting('storage_channel', 'Mavjud emas')}\n\n"
             "Kerakli bo'limni tanlang:",
             reply_markup=get_admin_keyboard()
         )
@@ -1447,7 +1480,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📅 Qolgan kunlar: {days_left} kun\n"
             f"⏰ Tugash sanasi: {sub_date.strftime('%Y-%m-%d')}\n"
             f"📊 Hisoblar: {accounts_count}/{max_accounts} ta\n"
-            f"⏱️ Interval: {user_min_interval}-{user_max_interval} daqiqa\n\n"
+            f"⏱️ Interval: {user_min_interval}-{user_max_interval} daqiqa\n"
+            f"📦 Media saqlash: Arxiv kanalida\n\n"
             f"🤖 Bot funksiyalaridan foydalaning:",
             reply_markup=get_user_keyboard()
         )
@@ -1500,7 +1534,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_user_text(update, context, text)
 
 async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Barcha media xabarlarni qayta ishlash (photo, video, document, audio, voice, sticker, animation)"""
+    """Barcha media xabarlarni qayta ishlash (arxiv kanaliga saqlash)"""
     user_id = update.effective_user.id
     mode = context.user_data.get("mode")
     message = update.message
@@ -1526,58 +1560,59 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Obunangiz tugagan!", reply_markup=get_user_keyboard())
         return
     
-    # Media turini aniqlash va file_id olish
+    # Arxiv kanalini tekshirish
+    storage_channel = get_storage_channel()
+    if storage_channel == 'not_set':
+        await update.message.reply_text(
+            "❌ **ARXIV KANALI SOZLANMAGAN!**\n\n"
+            "Iltimos, admin bilan bog'laning yoki /start ni bosing.",
+            reply_markup=get_user_keyboard()
+        )
+        return
+    
+    # Media turini aniqlash
     message_type = None
-    file_id = None
     file_name = None
     caption = message.caption or ""
     
     if message.photo:
         message_type = "photo"
-        file_id = message.photo[-1].file_id  # Eng katta o'lcham
     elif message.video:
         message_type = "video"
-        file_id = message.video.file_id
         file_name = message.video.file_name
     elif message.document:
         message_type = "document"
-        file_id = message.document.file_id
         file_name = message.document.file_name
     elif message.audio:
         message_type = "audio"
-        file_id = message.audio.file_id
         file_name = message.audio.file_name
     elif message.voice:
         message_type = "voice"
-        file_id = message.voice.file_id
     elif message.sticker:
         message_type = "sticker"
-        file_id = message.sticker.file_id
     elif message.animation:
         message_type = "animation"
-        file_id = message.animation.file_id
         file_name = message.animation.file_name
     elif message.video_note:
         message_type = "video_note"
-        file_id = message.video_note.file_id
     
-    if message_type and file_id:
+    if message_type:
         # Yuklanmoqda xabarini yuborish
-        loading_msg = await update.message.reply_text("⏳ Media yuklanmoqda...")
+        loading_msg = await update.message.reply_text("⏳ Media arxivlanmoqda...")
         
         try:
-            # Media faylni yuklab olish va saqlash
-            file_path, file_hash = await save_media_file(
+            # Media faylni arxiv kanaliga saqlash
+            storage_data, error = await save_media_to_channel(
                 context.bot, 
-                file_id, 
+                message, 
                 user_id, 
                 message_type,
                 file_name
             )
             
-            if file_path:
+            if storage_data:
                 # Xabarni bazaga saqlash
-                add_user_message(user_id, caption, message_type, file_path, file_hash)
+                add_user_message(user_id, caption, message_type, storage_data)
                 
                 type_names = {
                     'photo': '📷 Rasm',
@@ -1593,26 +1628,31 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 type_name = type_names.get(message_type, message_type)
                 caption_text = f"\n📝 Caption: {caption[:50]}..." if caption else ""
                 
-                # Fayl hajmini olish
-                file_size = os.path.getsize(file_path)
-                size_text = f"{file_size // 1024} KB" if file_size < 1024 * 1024 else f"{file_size // (1024 * 1024)} MB"
-                
-                await loading_msg.edit_text(
+                # Loading xabarini o'chirish va yangi xabar yuborish
+                await loading_msg.delete()
+                await update.message.reply_text(
                     f"✅ **XABAR QO'SHILDI!**\n\n"
                     f"📦 Turi: {type_name}\n"
-                    f"💾 Hajmi: {size_text}{caption_text}"
+                    f"💾 Saqlandi: Arxiv kanalida{caption_text}\n"
+                    f"🔗 Manzil: {storage_data}",
+                    reply_markup=get_user_keyboard()
                 )
                 context.user_data["mode"] = None
                 
-                logger.info(f"📦 Media xabar saqlandi: user_id={user_id}, type={message_type}, path={file_path}")
+                logger.info(f"📦 Media arxivlandi: user_id={user_id}, type={message_type}, storage={storage_data}")
             else:
-                await loading_msg.edit_text(
-                    "❌ **XATOLIK!**\n\nMedia faylni saqlashda xatolik yuz berdi.",
+                await loading_msg.delete()
+                await update.message.reply_text(
+                    f"❌ **XATOLIK!**\n\n{error or 'Media arxivlashda xatolik yuz berdi.'}",
                     reply_markup=get_user_keyboard()
                 )
         except Exception as e:
-            logger.error(f"Media saqlashda xato: {e}")
-            await loading_msg.edit_text(
+            logger.error(f"Media arxivlashda xato: {e}")
+            try:
+                await loading_msg.delete()
+            except:
+                pass
+            await update.message.reply_text(
                 f"❌ **XATOLIK!**\n\n{str(e)}",
                 reply_markup=get_user_keyboard()
             )
@@ -1751,7 +1791,8 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         msg += f"📱 Jami hisoblar: {total_accounts} ta\n"
         msg += f"👥 Jami guruhlar: {total_groups} ta\n"
         msg += f"📝 Jami xabarlar: {total_messages} ta\n"
-        msg += f"⏳ Kutilayotgan so'rovlar: {requests_count} ta\n\n"
+        msg += f"⏳ Kutilayotgan so'rovlar: {requests_count} ta\n"
+        msg += f"📦 Arxiv kanal: {get_setting('storage_channel', STORAGE_CHANNEL_USERNAME)}\n\n"
         msg += f"🔄 Avtomatik yuborish: {'✅ Yoqilgan' if is_sending else '❌ Oʻchirilgan'}\n"
         
         if last_send_time:
@@ -1765,7 +1806,8 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     elif text == "⚙️ Sozlamalar":
         keyboard = [
             ["📅 Interval sozlash", "🎲 Random rejim"],
-            ["📢 Xush kelib xabari", "🔙 Orqaga"]
+            ["📢 Xush kelib xabari", "📌 Arxiv kanali"],
+            ["🔙 Orqaga"]
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
@@ -1773,6 +1815,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             "⚙️ **BOT SOZLAMALARI**\n\n"
             f"📅 Interval: {min_interval}-{max_interval} daqiqa\n"
             f"🎲 Random xabarlar: {'✅ Yoqilgan' if random_messages else '❌ Oʻchirilgan'}\n"
+            f"📦 Arxiv kanal: {get_setting('storage_channel', STORAGE_CHANNEL_USERNAME)}\n"
             f"📢 Xush kelib xabari: {get_setting('welcome_message', 'Mavjud emas')[:50]}...\n\n"
             "Kerakli sozlamani tanlang:",
             reply_markup=reply_markup
@@ -1812,6 +1855,60 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         )
         context.user_data["mode"] = "set_welcome"
     
+    elif text == "📌 Arxiv kanali" or text == "📌 Kanal ID o'rnatish (Ixtiyoriy)":
+        current_channel = get_setting('storage_channel', STORAGE_CHANNEL_USERNAME)
+        
+        await update.message.reply_text(
+            f"📌 **ARXIV KANALI**\n\n"
+            f"Hozirgi kanal: {current_channel}\n\n"
+            "Yangi kanal username ni yuboring:\n"
+            "(Misol: @my_storage_channel)\n\n"
+            "Bekor qilish: /cancel"
+        )
+        context.user_data["mode"] = "set_storage_channel"
+    
+    elif mode == "set_storage_channel":
+        # Yangi arxiv kanalini sozlash
+        new_channel = text.strip()
+        
+        if not new_channel.startswith('@'):
+            await update.message.reply_text("❌ Kanal username @ bilan boshlanishi kerak!\nMisol: @my_storage_channel")
+            return
+        
+        # Kanalga kirishni tekshirish
+        try:
+            # Bot kanalda adminligini tekshirish uchun sinov xabari yuborish
+            test_msg = await context.bot.send_message(
+                chat_id=new_channel,
+                text="🤖 **Bot test xabari**\n\nBu kanal arxiv uchun sozlanmoqda..."
+            )
+            
+            # Agar xabar yuborish muvaffaqiyatli bo'lsa
+            await context.bot.delete_message(
+                chat_id=new_channel,
+                message_id=test_msg.message_id
+            )
+            
+            # Sozlamani yangilash
+            save_setting('storage_channel', new_channel)
+            
+            await update.message.reply_text(
+                f"✅ **Arxiv kanali yangilandi!**\n\n"
+                f"📦 Yangi kanal: {new_channel}\n\n"
+                f"Endi barcha media fayllar ushbu kanalga saqlanadi.",
+                reply_markup=get_admin_keyboard()
+            )
+            context.user_data["mode"] = None
+            
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ **XATOLIK!**\n\n"
+                f"Kanalga kirishda xatolik: {str(e)}\n\n"
+                f"Bot kanalda admin bo'lishi va xabar yubora olishi kerak.",
+                reply_markup=get_admin_keyboard()
+            )
+            context.user_data["mode"] = None
+    
     elif text == "🔙 Orqaga":
         await update.message.reply_text("👑 **Admin Paneli**", reply_markup=get_admin_keyboard())
         context.user_data.clear()
@@ -1845,7 +1942,9 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             for acc in accounts:
                 display_name, phone, _, _, is_active, _, _ = acc
                 status = "✅" if is_active == 1 else "❌"
-                keyboard.append([f"{status} {display_name} ({uid})"])
+                # Display name'ni oddiy ko'rinishda chiqaramiz
+                simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
+                keyboard.append([f"{status} {simple_name} ({uid})"])
         
         keyboard.append(["🔙 Orqaga"])
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -1859,15 +1958,30 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     
     elif text.startswith("✅ ") or text.startswith("❌ "):
         if mode == "select_session_account":
-            # Format: "✅ account1 (123456789)" yoki "❌ account1 (123456789)"
+            # Format: "✅ 1 (123456789)" yoki "❌ 1 (123456789)"
             status_char = text[0]
             parts = text[2:].split(" (")
             if len(parts) == 2:
-                display_name = parts[0].strip()
+                simple_name = parts[0].strip()
                 user_id_str = parts[1].replace(")", "").strip()
                 
                 try:
                     target_user_id = int(user_id_str)
+                    
+                    # Asl display name'ni topish
+                    accounts = get_user_accounts(target_user_id)
+                    display_name = None
+                    for acc in accounts:
+                        acc_name = acc[0]
+                        # Simple name bilan solishtiramiz
+                        if simple_name == acc_name.split('_')[-1] if '_' in acc_name else acc_name:
+                            display_name = acc_name
+                            break
+                    
+                    if not display_name:
+                        await update.message.reply_text("❌ Hisob topilmadi!")
+                        return
+                    
                     context.user_data["session_account"] = display_name
                     context.user_data["session_user_id"] = target_user_id
                     
@@ -2073,7 +2187,8 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text(
             f"🔄 **YANGILANDI**\n\n"
             f"📊 Jami foydalanuvchilar: {len(get_all_users())}\n"
-            f"⏳ Kutilayotgan so'rovlar: {len(pending_requests)}",
+            f"⏳ Kutilayotgan so'rovlar: {len(pending_requests)}\n"
+            f"📦 Arxiv kanal: {get_setting('storage_channel', STORAGE_CHANNEL_USERNAME)}",
             reply_markup=get_admin_keyboard()
         )
     
@@ -2194,7 +2309,10 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             # Session faylini tekshirish
             session_exists_flag = session_exists(display_name)
             
-            msg += f"📱 **{display_name}** (+{phone})\n"
+            # Simple name chiqaramiz
+            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
+            
+            msg += f"📱 **{simple_name}** (+{phone})\n"
             msg += f"   📁 Session fayli: {'✅ Mavjud' if session_exists_flag else '❌ Yoʻq'}\n"
             msg += f"   🔧 Status: {'✅ Faol' if is_active == 1 else '❌ Nofaol'}\n\n"
         
@@ -2212,7 +2330,8 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             "🎨 Stiker\n"
             "🎞 GIF\n"
             "📝 Matn\n\n"
-            "Bu xabarlar guruhlaringizga yuboriladi.\n\n"
+            "Bu xabarlar guruhlaringizga yuboriladi.\n"
+            "📦 Media fayllar arxiv kanalida saqlanadi.\n\n"
             "Bekor qilish: /cancel"
         )
         context.user_data["mode"] = "add_message"
@@ -2227,7 +2346,9 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         for acc in accounts:
             display_name = acc[0]
             phone = acc[1]
-            keyboard.append([f"📱 {display_name} (+{phone})"])
+            # Simple name chiqaramiz
+            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
+            keyboard.append([f"📱 {simple_name} (+{phone})"])
         
         keyboard.append(["🔙 Orqaga"])
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -2251,12 +2372,13 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         for acc in accounts:
             display_name = acc[0]
             phone = acc[1]
+            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
             groups = get_user_groups(user_id, display_name)
             
             active_groups = sum(1 for g in groups if g[4] == 1)
             total_groups = len(groups)
             
-            msg += f"📱 **{display_name}** (+{phone})\n"
+            msg += f"📱 **{simple_name}** (+{phone})\n"
             msg += f"   📊 Guruhlar: {active_groups}/{total_groups} ta\n\n"
         
         keyboard = [[InlineKeyboardButton("⚙️ Guruhlarni boshqarish", callback_data="manage_groups")]]
@@ -2321,7 +2443,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         keyboard = [
             [InlineKeyboardButton("👁 Hisoblarni ko'rish", callback_data="view_accounts")],
             [InlineKeyboardButton("🗑️ Hisobni o'chirish", callback_data="delete_account_menu")],
-            [InlineKeyboardButton("🔙 Orqaga", callback_data="back_to_main")]
+            [InlineKeyboardButton("🔙 Orqaga", callback_data="back_to_main")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -2353,8 +2475,8 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         msg = "📝 **XABARLAR RO'YXATI**\n\n"
         
         for i, m in enumerate(messages[:10], 1):
-            # m = (id, message_type, file_path, file_hash, text)
-            msg_id, msg_type, file_path, file_hash, msg_text = m
+            # m = (id, message_type, storage_data, text)
+            msg_id, msg_type, storage_data, msg_text = m
             msg_type = msg_type or 'text'
             icon = type_icons.get(msg_type, '📦')
             
@@ -2416,6 +2538,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         msg += f"📝 Xabarlar: {total_messages} ta\n"
         msg += f"📅 Obuna: {days_left} kun qoldi\n"
         msg += f"⏱️ Interval: {user_min_interval}-{user_max_interval} daqiqa\n"
+        msg += f"📦 Media saqlash: Arxiv kanalida\n"
         msg += f"🔄 Yuborish: {'✅ Yoqilgan' if is_sending else '❌ Oʻchirilgan'}"
         
         try:
@@ -2424,11 +2547,25 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             await update.message.reply_text(msg)
     
     elif text.startswith("📱 ") and mode == "select_account":
-        display_name = text[2:].split(" ")[0]
+        simple_name = text[2:].split(" ")[0]
+        
+        # Asl display name'ni topish
+        accounts = get_user_accounts(user_id)
+        display_name = None
+        for acc in accounts:
+            acc_name = acc[0]
+            if simple_name == acc_name.split('_')[-1] if '_' in acc_name else acc_name:
+                display_name = acc_name
+                break
+        
+        if not display_name:
+            await update.message.reply_text("❌ Hisob topilmadi!")
+            return
+        
         context.user_data["selected_account"] = display_name
         
         await update.message.reply_text(
-            f"✅ **{display_name} tanlandi!**\n\n"
+            f"✅ **{simple_name} tanlandi!**\n\n"
             "Endi guruhlarni yuboring:\n"
             "• Har bir guruh alohida qatorda\n"
             "• @guruh_nomi yoki https://t.me/guruh_nomi\n\n"
@@ -2478,15 +2615,18 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             await update.message.reply_text("❌ Hisob limitiga yetdingiz! Maksimum 5 ta hisob.")
             return
         
-        display_name = f"account{account_number}"
+        display_name = f"account_{user_id}_{account_number}"
         
         # Hisobni bazaga qo'shish
         result = add_user_account(user_id, phone=phone, country_code="998", username="", display_name=display_name)
         
         if result:
+            # Simple name (faqat oxirgi raqam)
+            simple_name = str(account_number)
+            
             await update.message.reply_text(
                 f"✅ **HISOB QO'SHILDI!**\n\n"
-                f"📱 Hisob: {display_name}\n"
+                f"📱 Hisob: {simple_name}\n"
                 f"📞 Telefon: +{phone}\n\n"
                 f"⏳ Kod yuborilmoqda..."
             )
@@ -2509,7 +2649,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                     reply_markup=ReplyKeyboardRemove()
                 )
             elif success:
-                await update.message.reply_text(
+                await update.message_reply_text(
                     f"✅ **Hisob faollashtirildi!**\n\n{message}",
                     reply_markup=get_user_keyboard()
                 )
@@ -2528,7 +2668,8 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             context.user_data.clear()
     
     elif mode == "add_message":
-        add_user_message(user_id, text, message_type='text', file_path=None, file_hash=None)
+        # Oddiy text xabar qo'shish
+        add_user_message(user_id, text, message_type='text', storage_data=None)
         await update.message.reply_text(
             f"✅ **XABAR QO'SHILDI!**\n\n"
             f"📦 Turi: 📝 Matn\n"
@@ -2633,7 +2774,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         if success:
             await update.message.reply_text(
                 f"✅ **HISOB FAOLLASHTIRILDI!**\n\n"
-                f"📱 Hisob: {pending_account}\n"
+                f"📱 Hisob: {pending_account.split('_')[-1] if '_' in pending_account else pending_account}\n"
                 f"✅ Status: Faol\n\n"
                 f"Endi guruh qo'shishingiz va xabar yuborishingiz mumkin!",
                 reply_markup=get_user_keyboard()
@@ -2646,7 +2787,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             
             await update.message.reply_text(
                 f"🔐 **2FA PAROL KERAK!**\n\n"
-                f"📱 Hisob: {pending_account}\n\n"
+                f"📱 Hisob: {pending_account.split('_')[-1] if '_' in pending_account else pending_account}\n\n"
                 f"⌨️ Iltimos, 2FA parolingizni kiriting:\n"
                 f"(Agar paroldan keyin kod ham kerak bo'lsa: parol.kod)\n\n"
                 f"Bekor qilish: /cancel",
@@ -2688,7 +2829,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         if success:
             await update.message.reply_text(
                 f"✅ **HISOB TO'LIQ FAOLLASHTIRILDI!**\n\n"
-                f"📱 Hisob: {pending_account}\n"
+                f"📱 Hisob: {pending_account.split('_')[-1] if '_' in pending_account else pending_account}\n"
                 f"🔐 2FA parol tasdiqlandi\n"
                 f"✅ Status: To'liq faol\n\n"
                 f"Endi guruh qo'shishingiz va xabar yuborishingiz mumkin!",
@@ -2802,11 +2943,18 @@ async def process_delete_user(update: Update, context: ContextTypes.DEFAULT_TYPE
         if target_user_id is None:
             await update.message.reply_text("❌ Noto'g'ri ID! Faqat raqam kiriting.")
             return
+        
+        # Arxiv kanaldan ma'lumotlarni o'chirish
+        deleted_count, failed_count = await delete_user_data_from_channel(target_user_id, context)
+        
+        # Bazadan ma'lumotlarni o'chirish
         delete_user_data(target_user_id)
         
         await update.message.reply_text(
             f"✅ **Foydalanuvchi o'chirildi!**\n\n"
-            f"👤 Foydalanuvchi ID: {target_user_id}\n\n"
+            f"👤 Foydalanuvchi ID: {target_user_id}\n"
+            f"🗑️ Arxivdan o'chirildi: {deleted_count} ta xabar\n"
+            f"❌ Arxiv xatolari: {failed_count} ta\n\n"
             f"Barcha ma'lumotlar tozalandi.",
             reply_markup=get_admin_keyboard()
         )
@@ -2943,11 +3091,17 @@ async def process_remove_command(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text("❌ Format: /remove ID\nMisol: /remove 123456789")
             return
         
+        # Arxiv kanaldan ma'lumotlarni o'chirish
+        deleted_count, failed_count = await delete_user_data_from_channel(target_user_id, context)
+        
+        # Bazadan ma'lumotlarni o'chirish
         delete_user_data(target_user_id)
         
         await update.message.reply_text(
             f"✅ **Foydalanuvchi o'chirildi!**\n\n"
-            f"👤 Foydalanuvchi ID: {target_user_id}\n\n"
+            f"👤 Foydalanuvchi ID: {target_user_id}\n"
+            f"🗑️ Arxivdan o'chirildi: {deleted_count} ta xabar\n"
+            f"❌ Arxiv xatolari: {failed_count} ta\n\n"
             f"Barcha ma'lumotlar tozalandi.",
             reply_markup=get_admin_keyboard()
         )
@@ -3010,7 +3164,7 @@ async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if not context.args or len(context.args) != 2:
-        await update.message.reply_text("❌ Format: /code DISPLAY_NAME KOD\nMisol: /code account1 12345")
+        await update.message.reply_text("❌ Format: /code DISPLAY_NAME KOD\nMisol: /code account_123456789_1 12345")
         return
     
     display_name = context.args[0]
@@ -3034,11 +3188,12 @@ async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if result:
             target_user_id = result[0]
+            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
             try:
                 await context.bot.send_message(
                     target_user_id,
                     f"🎉 **HISOBINGIZ FAOL QILINDI!**\n\n"
-                    f"📱 Hisob: {display_name}\n"
+                    f"📱 Hisob: {simple_name}\n"
                     f"✅ Status: Faol\n\n"
                     f"Endi guruh qo'shishingiz va xabar yuborishingiz mumkin!"
                 )
@@ -3054,7 +3209,7 @@ async def password_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if not context.args or len(context.args) != 2:
-        await update.message.reply_text("❌ Format: /password DISPLAY_NAME PAROL\nMisol: /password account1 mypassword")
+        await update.message.reply_text("❌ Format: /password DISPLAY_NAME PAROL\nMisol: /password account_123456789_1 mypassword")
         return
     
     display_name = context.args[0]
@@ -3078,11 +3233,12 @@ async def password_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if result:
             target_user_id = result[0]
+            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
             try:
                 await context.bot.send_message(
                     target_user_id,
                     f"🔐 **2FA PAROL TASDIQLANDI!**\n\n"
-                    f"📱 Hisob: {display_name}\n"
+                    f"📱 Hisob: {simple_name}\n"
                     f"✅ Status: To'liq faol\n\n"
                     f"Hisobingiz endi to'liq faol holatda!"
                 )
@@ -3098,7 +3254,7 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if not context.args or len(context.args) != 1:
-        await update.message.reply_text("❌ Format: /test DISPLAY_NAME\nMisol: /test account1")
+        await update.message.reply_text("❌ Format: /test DISPLAY_NAME\nMisol: /test account_123456789_1")
         return
     
     display_name = context.args[0]
@@ -3131,6 +3287,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for acc in accounts:
             display_name = acc[0]
             is_account_active = acc[4]  # is_active field
+            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
             groups = get_user_groups(user_id, display_name)
             
             if groups:
@@ -3141,7 +3298,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 account_status = "✅" if is_account_active == 1 else "❌"
                 keyboard.append([InlineKeyboardButton(
-                    f"{account_status} {display_name} ({active_groups} faol / {len(groups)} jami)", 
+                    f"{account_status} {simple_name} ({active_groups} faol / {len(groups)} jami)", 
                     callback_data=f"account_{display_name}"
                 )])
         
@@ -3163,7 +3320,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         groups = get_user_groups(user_id, display_name)
         
         if not groups:
-            await query.edit_message_text(f"❌ {display_name} hisobida guruh yo'q!")
+            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
+            await query.edit_message_text(f"❌ {simple_name} hisobida guruh yo'q!")
             return
         
         # Statistika
@@ -3186,6 +3344,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             keyboard.append([InlineKeyboardButton(text, callback_data=f"group_{group_db_id}")])
         
+        simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
         keyboard.append([
             InlineKeyboardButton("✅ Hammasini yoqish", callback_data=f"enable_all_{display_name}"),
             InlineKeyboardButton("❌ Hammasini o'chirish", callback_data=f"disable_all_{display_name}")
@@ -3195,7 +3354,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            f"⚙️ **{display_name} - GURUHLAR**\n\n"
+            f"⚙️ **{simple_name} - GURUHLAR**\n\n"
             f"📊 Statistika: {active_groups} faol / {inactive_groups} nofaol / {len(groups)} jami\n\n"
             f"✅ - faol (xabar yuboriladi)\n"
             f"❌ - nofaol (xabar yuborilmaydi)\n\n"
@@ -3228,7 +3387,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(
             f"📢 **GURUH MA'LUMOTLARI**\n\n"
-            f"📱 Hisob: {account_name}\n"
+            f"📱 Hisob: {account_name.split('_')[-1] if '_' in account_name else account_name}\n"
             f"📢 Guruh: {group_title}{username_text}\n"
             f"🆔 ID: {tg_group_id}\n"
             f"🔧 Status: {status}\n\n"
@@ -3246,12 +3405,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         account_name = group[2]
         group_title = group[4]
+        simple_name = account_name.split('_')[-1] if '_' in account_name else account_name
         
         update_group_active_status([group_id], 1)
         
         await query.edit_message_text(
             f"✅ **GURUH FAOLLASHTIRILDI!**\n\n"
-            f"📱 Hisob: {account_name}\n"
+            f"📱 Hisob: {simple_name}\n"
             f"📢 Guruh: {group_title}\n"
             f"🔧 Status: ✅ Faol"
         )
@@ -3271,12 +3431,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         account_name = group[2]
         group_title = group[4]
+        simple_name = account_name.split('_')[-1] if '_' in account_name else account_name
         
         update_group_active_status([group_id], 0)
         
         await query.edit_message_text(
             f"❌ **GURUH NOFAOLLASHTIRILDI!**\n\n"
-            f"📱 Hisob: {account_name}\n"
+            f"📱 Hisob: {simple_name}\n"
             f"📢 Guruh: {group_title}\n"
             f"🔧 Status: ❌ Nofaol"
         )
@@ -3296,6 +3457,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         account_name = group[2]
         group_title = group[4]
+        simple_name = account_name.split('_')[-1] if '_' in account_name else account_name
         
         # Tasdiqlash tugmalari
         keyboard = [
@@ -3307,7 +3469,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"⚠️ **TASDIQLASH**\n\n"
             f"📢 **{group_title}** guruhini o'chirmoqchimisiz?\n\n"
-            f"📱 Hisob: {account_name}\n\n"
+            f"📱 Hisob: {simple_name}\n\n"
             f"Bu amalni bekor qilib bo'lmaydi!",
             reply_markup=reply_markup
         )
@@ -3322,6 +3484,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         account_name = group[2]
         group_title = group[4]
+        simple_name = account_name.split('_')[-1] if '_' in account_name else account_name
         
         # Guruhni o'chirish
         success = delete_group_by_id(group_id)
@@ -3344,6 +3507,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith("enable_all_"):
         display_name = data.replace("enable_all_", "")
+        simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
         
         groups = get_user_groups(user_id, display_name)
         group_ids = [g[0] for g in groups]
@@ -3351,10 +3515,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if group_ids:
             update_group_active_status(group_ids, 1)
         
-        await query.edit_message_text(f"✅ **{display_name}**\n\nBarcha guruhlar faollashtirildi!\nJami: {len(group_ids)} ta guruh")
+        await query.edit_message_text(f"✅ **{simple_name}**\n\nBarcha guruhlar faollashtirildi!\nJami: {len(group_ids)} ta guruh")
     
     elif data.startswith("disable_all_"):
         display_name = data.replace("disable_all_", "")
+        simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
         
         groups = get_user_groups(user_id, display_name)
         group_ids = [g[0] for g in groups]
@@ -3362,7 +3527,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if group_ids:
             update_group_active_status(group_ids, 0)
         
-        await query.edit_message_text(f"✅ **{display_name}**\n\nBarcha guruhlar o'chirildi!\nJami: {len(group_ids)} ta guruh")
+        await query.edit_message_text(f"✅ **{simple_name}**\n\nBarcha guruhlar o'chirildi!\nJami: {len(group_ids)} ta guruh")
     
     elif data == "finish_groups":
         await query.edit_message_text("✅ **Guruhlar muvaffaqiyatli qo'shildi!**\n\nEndi asosiy menyudan boshqa funksiyalardan foydalanishingiz mumkin.")
@@ -3397,8 +3562,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             display_name, phone, country_code, username, is_active, is_premium, subscription_end = acc
             
             status = "✅ Faol" if is_active == 1 else "❌ Nofaol"
+            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
             
-            msg += f"{i}. **{display_name}**\n"
+            msg += f"{i}. **{simple_name}**\n"
             msg += f"   📞: +{phone}\n"
             msg += f"   👤: @{username or 'Yoq'}\n"
             msg += f"   📊: {status}\n\n"
@@ -3418,7 +3584,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("👁 Hisoblarni ko'rish", callback_data="view_accounts")],
             [InlineKeyboardButton("🗑️ Hisobni o'chirish", callback_data="delete_account_menu")],
-            [InlineKeyboardButton("🔙 Orqaga", callback_data="back_to_main")]
+            [InlineKeyboardButton("🔙 Orqaga", callback_data="back_to_main")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -3440,7 +3606,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for acc in accounts:
             display_name, phone, _, _, is_active, _, _ = acc
             status = "✅" if is_active == 1 else "❌"
-            keyboard.append([InlineKeyboardButton(f"{status} {display_name} (+{phone})", callback_data=f"confirm_delete_{display_name}")])
+            simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
+            keyboard.append([InlineKeyboardButton(f"{status} {simple_name} (+{phone})", callback_data=f"confirm_delete_{display_name}")])
         
         keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_to_accounts_menu")])
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -3455,6 +3622,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("confirm_delete_"):
         # O'chirishni tasdiqlash
         display_name = data.replace("confirm_delete_", "")
+        simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
         
         keyboard = [
             [InlineKeyboardButton("✅ Ha, o'chirish", callback_data=f"do_delete_{display_name}")],
@@ -3464,7 +3632,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(
             f"⚠️ **TASDIQLASH**\n\n"
-            f"📱 **{display_name}** hisobini o'chirmoqchimisiz?\n\n"
+            f"📱 **{simple_name}** hisobini o'chirmoqchimisiz?\n\n"
             f"Bu amalni bekor qilib bo'lmaydi!\n"
             f"Session fayli va barcha guruhlar ham o'chiriladi.",
             reply_markup=reply_markup
@@ -3473,30 +3641,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("do_delete_"):
         # Hisobni o'chirish
         display_name = data.replace("do_delete_", "")
+        simple_name = display_name.split('_')[-1] if '_' in display_name else display_name
         
         success = delete_user_account(user_id, display_name)
         
         if success:
             await query.edit_message_text(
                 f"✅ **HISOB O'CHIRILDI!**\n\n"
-                f"📱 **{display_name}** muvaffaqiyatli o'chirildi.\n"
+                f"📱 **{simple_name}** muvaffaqiyatli o'chirildi.\n"
                 f"Session fayli va barcha guruhlar tozalandi."
             )
         else:
             await query.edit_message_text(
                 f"❌ **XATOLIK!**\n\n"
-                f"📱 **{display_name}** hisobini o'chirishda xatolik yuz berdi."
+                f"📱 **{simple_name}** hisobini o'chirishda xatolik yuz berdi."
             )
         
         await context.bot.send_message(chat_id=user_id, text="🤖 **Asosiy menyu**", reply_markup=get_user_keyboard())
     
     elif data == "confirm_clear_messages":
-        # Xabarlarni tozalash
+        # Xabarlarni tozalash (faqat bazadan)
         deleted_count = delete_user_messages(user_id)
         
         await query.edit_message_text(
             f"✅ **XABARLAR TOZALANDI!**\n\n"
-            f"🗑️ {deleted_count} ta xabar o'chirildi."
+            f"🗑️ {deleted_count} ta xabar bazadan o'chirildi.\n"
+            f"📦 Arxiv kanaldagi media fayllar saqlanib qoladi."
         )
         
         await context.bot.send_message(chat_id=user_id, text="🤖 **Asosiy menyu**", reply_markup=get_user_keyboard())
@@ -3517,9 +3687,8 @@ async def auto_send_loop():
     
     print("🔄 Avtomatik yuborish loopi ishga tushdi...")
     
-    # Session va media papkalarini yaratish
+    # Session papkasini yaratish
     init_sessions_dir()
-    init_media_dir()
     
     while True:
         try:
@@ -3573,7 +3742,7 @@ async def auto_send_loop():
                         for group in active_groups:
                             group_id = group[1]
                             
-                            # Haqiqiy xabar yuborish (yangi format)
+                            # Haqiqiy xabar yuborish (arxiv kanal orqali)
                             success, result = await send_message_to_group(display_name, group_id, msg_data)
                             
                             # Log uchun xabar matni
@@ -3629,11 +3798,10 @@ def main():
     # Baza va sessions papkasini yaratish
     init_database()
     init_sessions_dir()
-    init_media_dir()
     
     print(f"\n✅ Baza fayli: {DB_FILE}")
     print(f"✅ Sessions papkasi: {SESSIONS_DIR}")
-    print(f"✅ Media papkasi: {MEDIA_DIR}")
+    print(f"📦 Arxiv kanal: {STORAGE_CHANNEL_USERNAME}")
     print(f"👑 Admin ID: {ADMIN_ID}")
     print(f"📡 API ID: {API_ID}")
     print("="*60)
@@ -3683,6 +3851,11 @@ def main():
         print("  /add ID KUNLAR - Ruxsat berish")
         print("  /reject ID - So'rovni rad etish")
         print("  /remove ID - Foydalanuvchini o'chirish")
+        print("\n📦 ARXIV TIZIMI:")
+        print(f"  • Media fayllar: {STORAGE_CHANNEL_USERNAME} kanalida saqlanadi")
+        print("  • CHAT_ID:MESSAGE_ID formatida bazaga yoziladi")
+        print("  • Server xotirasi tejiladi")
+        print("  • Obuna tugaganda arxiv kanaldan o'chiriladi")
         print("="*60)
         
         # Polling
